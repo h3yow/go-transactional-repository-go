@@ -2,8 +2,6 @@ package repository
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"sort"
 )
@@ -22,32 +20,9 @@ type Page struct {
 	NextCursor string // 为空表示没有更多数据
 }
 
-// recordValue 是 Item 在存储层的编码载体。
-type recordValue struct {
-	SortKey string `json:"s"`
-	Data    string `json:"d"` // base64
-}
-
-func encodeValue(sortKey string, data []byte) []byte {
-	raw, _ := json.Marshal(recordValue{
-		SortKey: sortKey,
-		Data:    base64.StdEncoding.EncodeToString(data),
-	})
-	return raw
-}
-
-func decodeRecord(rec Record) (Item, error) {
-	var v recordValue
-	if err := json.Unmarshal(rec.Value, &v); err != nil {
-		return Item{}, &Error{Kind: KindInternal, Op: "decodeRecord",
-			Err: errors.New("corrupt record payload")}
-	}
-	data, err := base64.StdEncoding.DecodeString(v.Data)
-	if err != nil {
-		return Item{}, &Error{Kind: KindInternal, Op: "decodeRecord",
-			Err: errors.New("corrupt record payload")}
-	}
-	return Item{ID: rec.Key, SortKey: v.SortKey, Data: data, Version: rec.Version}, nil
+// itemFromRecord 将存储记录转换为对外数据项。
+func itemFromRecord(rec Record) Item {
+	return Item{ID: rec.Key, SortKey: rec.SortKey, Data: rec.Value, Version: rec.Version}
 }
 
 // Repository 是基于 Store 的仓储，提供事务、乐观锁与游标分页。
@@ -123,7 +98,7 @@ func (tx *Tx) Get(ctx context.Context, id string) (Item, error) {
 	if err != nil {
 		return Item{}, normalize("tx.Get", err)
 	}
-	return decodeRecord(rec)
+	return itemFromRecord(rec), nil
 }
 
 // Put 写入记录。expectedVersion 为 0 表示创建（记录必须不存在），
@@ -136,7 +111,8 @@ func (tx *Tx) Put(ctx context.Context, id, sortKey string, data []byte, expected
 	tx.staged[id] = stagedWrite{
 		mutation: Mutation{
 			Key:             id,
-			Value:           encodeValue(sortKey, data),
+			SortKey:         sortKey,
+			Value:           data,
 			ExpectedVersion: expectedVersion,
 		},
 		item: Item{ID: id, SortKey: sortKey, Data: data, Version: expectedVersion + 1},
@@ -156,6 +132,32 @@ func (tx *Tx) Delete(ctx context.Context, id string, expectedVersion uint64) err
 	return nil
 }
 
+// scanPage 从位置 from 起流式扫描，收集至多 limit 条满足 keep 的记录。
+// 返回收集到的记录、最后扫描到的位置以及是否已耗尽（后端确认无更多记录）。
+// 每次只向后端请求补齐当前页所需的条数，后端单次返回受限时自动续扫，
+// 不会一次性把全部记录读入内存。
+func (r *Repository) scanPage(ctx context.Context, from ScanPosition, keep func(Item) bool, limit int) (items []Item, last ScanPosition, exhausted bool, err error) {
+	items = make([]Item, 0, limit)
+	last = from
+	for len(items) < limit {
+		recs, err := r.store.ScanSorted(ctx, last, limit-len(items))
+		if err != nil {
+			return nil, last, false, normalize("scanPage", err)
+		}
+		if len(recs) == 0 {
+			return items, last, true, nil
+		}
+		for _, rec := range recs {
+			item := itemFromRecord(rec)
+			last = ScanPosition{SortKey: item.SortKey, Key: item.ID}
+			if keep == nil || keep(item) {
+				items = append(items, item)
+			}
+		}
+	}
+	return items, last, false, nil
+}
+
 // List 按 (SortKey, ID) 的稳定顺序做键集分页。
 // 排序键重复时以 ID 作为决胜键，顺序完全确定。
 // cursor 为空表示从头开始；非法游标返回 KindInvalidCursor。
@@ -165,50 +167,21 @@ func (r *Repository) List(ctx context.Context, limit int, cursorStr string) (Pag
 		return Page{}, &Error{Kind: KindContractViolation, Op: "List",
 			Err: errors.New("limit must be positive")}
 	}
-	var c cursor
+	var from ScanPosition
 	if cursorStr != "" {
-		var err error
-		c, err = decodeCursor(cursorStr)
+		c, err := decodeCursor(cursorStr)
 		if err != nil {
 			return Page{}, err
 		}
+		from = ScanPosition{SortKey: c.SortKey, Key: c.Key}
 	}
-	recs, err := r.store.Scan(ctx, "", -1)
+	items, last, exhausted, err := r.scanPage(ctx, from, nil, limit)
 	if err != nil {
-		return Page{}, normalize("List", err)
+		return Page{}, err
 	}
-	items := make([]Item, 0, len(recs))
-	for _, rec := range recs {
-		item, err := decodeRecord(rec)
-		if err != nil {
-			return Page{}, err
-		}
-		items = append(items, item)
-	}
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].SortKey != items[j].SortKey {
-			return items[i].SortKey < items[j].SortKey
-		}
-		return items[i].ID < items[j].ID
-	})
-	// 键集过滤：只保留严格位于游标之后的记录。
-	start := 0
-	if cursorStr != "" {
-		start = sort.Search(len(items), func(i int) bool {
-			if items[i].SortKey != c.SortKey {
-				return items[i].SortKey > c.SortKey
-			}
-			return items[i].ID > c.Key
-		})
-	}
-	items = items[start:]
-	page := Page{}
-	if len(items) > limit {
-		page.Items = items[:limit]
-		last := page.Items[len(page.Items)-1]
-		page.NextCursor = encodeCursor(cursor{SortKey: last.SortKey, Key: last.ID})
-	} else {
-		page.Items = items
+	page := Page{Items: items}
+	if !exhausted {
+		page.NextCursor = encodeCursor(cursor{SortKey: last.SortKey, Key: last.Key})
 	}
 	return page, nil
 }

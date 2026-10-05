@@ -271,17 +271,17 @@ func (s *sliceStore) Get(_ context.Context, key string) (Record, error) {
 	return Record{}, &Error{Kind: KindNotFound, Op: "slice.Get", Err: errors.New("missing")}
 }
 
-func (s *sliceStore) Scan(_ context.Context, after string, limit int) ([]Record, error) {
+func (s *sliceStore) ScanSorted(_ context.Context, after ScanPosition, limit int) ([]Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []Record
 	for _, r := range s.recs {
-		if r.Key > after {
+		if positionAfter(r, after) {
 			out = append(out, r)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
-	if limit >= 0 && len(out) > limit {
+	sort.Slice(out, func(i, j int) bool { return lessRecord(out[i], out[j]) })
+	if len(out) > limit {
 		out = out[:limit]
 	}
 	return out, nil
@@ -309,13 +309,13 @@ func (s *sliceStore) Commit(_ context.Context, mutations []Mutation) error {
 				s.recs = append(s.recs[:i], s.recs[i+1:]...)
 				delete(idx, m.Key)
 			} else {
-				s.recs[i] = Record{Key: m.Key, Value: m.Value, Version: m.ExpectedVersion + 1}
+				s.recs[i] = Record{Key: m.Key, SortKey: m.SortKey, Value: m.Value, Version: m.ExpectedVersion + 1}
 			}
 			continue
 		}
 		if !m.Delete {
 			idx[m.Key] = len(s.recs)
-			s.recs = append(s.recs, Record{Key: m.Key, Value: m.Value, Version: m.ExpectedVersion + 1})
+			s.recs = append(s.recs, Record{Key: m.Key, SortKey: m.SortKey, Value: m.Value, Version: m.ExpectedVersion + 1})
 		}
 	}
 	return nil
