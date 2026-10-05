@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -19,7 +20,8 @@ func encodeCursor(c cursor) string {
 	return base64.RawURLEncoding.EncodeToString(raw)
 }
 
-// decodeCursor 解码游标；非法或损坏的游标返回 KindInvalidCursor 错误。
+// decodeCursor 解码游标；非法、损坏或来自其他查询（如导出游标）
+// 的游标返回 KindInvalidCursor 错误。
 func decodeCursor(s string) (cursor, error) {
 	invalid := &Error{Kind: KindInvalidCursor, Op: "decodeCursor",
 		Err: errors.New("malformed or expired cursor")}
@@ -27,8 +29,11 @@ func decodeCursor(s string) (cursor, error) {
 	if err != nil {
 		return cursor{}, invalid
 	}
+	// 严格解码：结构不符（包括导出游标等多字段格式）一律拒绝。
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
 	var c cursor
-	if err := json.Unmarshal(raw, &c); err != nil {
+	if err := dec.Decode(&c); err != nil {
 		return cursor{}, invalid
 	}
 	if c.Key == "" {

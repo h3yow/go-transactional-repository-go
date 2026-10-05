@@ -324,8 +324,9 @@ func (s *sliceStore) Commit(_ context.Context, mutations []Mutation) error {
 // TestBackendSwapSemantics 同一组读写/分页场景在两个后端上结果一致。
 func TestBackendSwapSemantics(t *testing.T) {
 	backends := map[string]func() Store{
-		"memory": func() Store { return NewMemoryStore() },
-		"slice":  func() Store { return &sliceStore{} },
+		"memory":     func() Store { return NewMemoryStore() },
+		"slice":      func() Store { return &sliceStore{} },
+		"chunked(2)": func() Store { return NewChunkedStore(2) },
 	}
 	for name, mk := range backends {
 		t.Run(name, func(t *testing.T) {

@@ -156,6 +156,26 @@ func (tx *Tx) Delete(ctx context.Context, id string, expectedVersion uint64) err
 	return nil
 }
 
+// scanAll 以固定块大小循环扫描后端全部记录，
+// 不依赖单次 Scan 调用返回全部数据（兼容单次读取有上限的后端）。
+func (r *Repository) scanAll(ctx context.Context) ([]Record, error) {
+	var out []Record
+	after := ""
+	for {
+		recs, err := r.store.Scan(ctx, after, scanChunkSize)
+		if err != nil {
+			return nil, err
+		}
+		if len(recs) == 0 {
+			break
+		}
+		out = append(out, recs...)
+		after = recs[len(recs)-1].Key
+		// 后端单次返回条数可能有上限，以空页作为数据耗尽的信号。
+	}
+	return out, nil
+}
+
 // List 按 (SortKey, ID) 的稳定顺序做键集分页。
 // 排序键重复时以 ID 作为决胜键，顺序完全确定。
 // cursor 为空表示从头开始；非法游标返回 KindInvalidCursor。
@@ -173,7 +193,7 @@ func (r *Repository) List(ctx context.Context, limit int, cursorStr string) (Pag
 			return Page{}, err
 		}
 	}
-	recs, err := r.store.Scan(ctx, "", -1)
+	recs, err := r.scanAll(ctx)
 	if err != nil {
 		return Page{}, normalize("List", err)
 	}
